@@ -1,0 +1,16 @@
+apiVersion: kvrocks-operator.org/v1alpha1
+kind: Kvrocks
+metadata:
+  name: example
+spec:
+  image: apache/kvrocks:2.17.0
+  storage:
+    size: 1Gi
+  auth:
+    passwordSecretRef:
+      name: example-auth
+      key: password
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi

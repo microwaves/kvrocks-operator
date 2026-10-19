@@ -1,0 +1,66 @@
+# Build outputs, downloaded tools, envtest binaries, and local image archives.
+/bin/
+/dist/
+
+# Compiled tests, coverage reports, and profiling output.
+*.test
+*.test.exe
+/coverage/
+/cover.out
+/coverage.out
+/coverage.html
+*.coverprofile
+*.prof
+*.pprof
+
+# Local Go workspace configuration; go.mod and go.sum remain versioned.
+/go.work
+/go.work.sum
+
+# Local agent instructions, settings, and session data.
+AGENTS.md
+AGENTS.MD
+AGENTS.local.md
+CLAUDE.md
+CLAUDE.local.md
+GEMINI.md
+.agents/
+.codex/
+.claude/
+.cursor/
+.cursorrules
+.cursorignore
+.gemini/
+.continue/
+.windsurf/
+.windsurfrules
+.aider*
+.mcp.json
+/.github/copilot-instructions.md
+/.github/instructions/
+/.github/prompts/
+/.github/agents/
+
+# Internal project planning; README.md contains the public project overview.
+/docs/project.md
+
+# Local credentials and environment overrides; keep example env files versioned.
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.kubeconfig
+/.kube/
+
+# Editor settings and temporary files.
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# macOS filesystem metadata.
+.DS_Store
+._*
+
+# Generated API code, CRDs, and RBAC under api/ and config/ are versioned.

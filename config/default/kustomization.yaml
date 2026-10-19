@@ -1,0 +1,6 @@
+namespace: kvrocks-operator-system
+namePrefix: kvrocks-operator-
+resources:
+  - ../crd
+  - ../rbac
+  - ../manager

@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- kvrocks-operator_v1alpha1_kvrocks.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

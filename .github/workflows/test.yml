@@ -1,0 +1,55 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-and-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: make test
+      - run: go vet ./...
+      - run: shellcheck internal/controller/startup.sh
+      - run: git diff --exit-code -- api config go.mod go.sum
+
+  lifecycle:
+    runs-on: ubuntu-latest
+    env:
+      KIND_CLUSTER: kvrocks-operator-ci
+      KUBECONFIG: ${{ github.workspace }}/bin/ci.kubeconfig
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Create isolated Kubernetes cluster
+        run: |
+          set -euo pipefail
+          go install sigs.k8s.io/kind@v0.33.0
+          mkdir -p bin
+          kind create cluster --name "${KIND_CLUSTER}" --image kindest/node:v1.37.0 --kubeconfig "${KUBECONFIG}"
+          curl -fsSL https://dl.k8s.io/release/v1.37.1/bin/linux/amd64/kubectl -o bin/kubectl
+          chmod +x bin/kubectl
+      - name: Build and load operator
+        run: |
+          set -euo pipefail
+          make docker-build
+          docker save --platform linux/amd64 -o bin/operator.tar kvrocks-operator:dev
+          kind load image-archive bin/operator.tar --name "${KIND_CLUSTER}"
+      - name: Test database lifecycle
+        run: KUBECTL="${PWD}/bin/kubectl" make test-e2e
+      - name: Remove test cluster
+        if: always()
+        run: kind delete cluster --name "${KIND_CLUSTER}"

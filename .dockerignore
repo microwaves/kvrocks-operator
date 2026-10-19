@@ -1,0 +1,7 @@
+**
+!**/*.go
+**/*_test.go
+!internal/controller/startup.sh
+!go.mod
+!go.sum
+!LICENSE
