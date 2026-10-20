@@ -3,6 +3,7 @@
 # It should be run by config/default
 resources:
 - bases/kvrocks-operator.org_kvrocks.yaml
+- bases/kvrocks-operator.org_kvrocksbackups.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

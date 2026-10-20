@@ -19,4 +19,12 @@ resources:
   kind: Kvrocks
   path: github.com/microwaves/kvrocks-operator/api/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  domain: org
+  group: kvrocks-operator
+  kind: KvrocksBackup
+  path: github.com/microwaves/kvrocks-operator/api/v1alpha1
+  version: v1alpha1
 version: "3"
