@@ -1,0 +1,15 @@
+# API example only: backup execution is not implemented yet.
+apiVersion: kvrocks-operator.org/v1alpha1
+kind: KvrocksBackup
+metadata:
+  name: example-manual-001
+spec:
+  kvrocksRef:
+    name: example
+  destination:
+    s3:
+      bucket: example-kvrocks-backups
+      region: eu-west-1
+      prefix: example
+      credentialsSecretRef:
+        name: backup-writer

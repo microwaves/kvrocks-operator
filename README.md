@@ -124,11 +124,39 @@ Before starting the first database Pod, the operator persists the volume name an
 
 Standalone and cluster modes use different Kvrocks key encodings. Transitioning an existing standalone dataset to sharding will require a migration; the operator will not toggle cluster mode on an existing volume.
 
-Managed backup/restore resources, object-store transfer, replication, failover, sharding, volume expansion, image upgrades, external exposure, and cache-specific durability settings are not yet implemented. A single local kind node does not validate storage-provider durability or multi-zone behavior.
+Backup/restore execution, object-store transfer, replication, failover, sharding, volume expansion, image upgrades, external exposure, and cache-specific durability settings are not yet implemented. A single local kind node does not validate storage-provider durability or multi-zone behavior.
+
+## Backup and restore API
+
+The `v1alpha1` schemas are available for the next implementation slice. A `KvrocksBackup` currently records a request only: no backup controller or worker runs it. A `Kvrocks` with `spec.bootstrap.restore` reports `Ready=False` and `Restored=False`, reason `RestoreNotImplemented`, and creates neither a PVC nor a StatefulSet. Databases without bootstrap keep the existing standalone behavior.
+
+One `KvrocksBackup` represents one immutable backup request. Its spec names the source database and an S3 destination: bucket, region, optional prefix, and a credential Secret reference. Reapplying the same object cannot request another capture; create another object for that. See the [backup API example](config/samples/kvrocks-operator_v1alpha1_kvrocksbackup.yaml), which is deliberately excluded from the runnable sample kustomization.
+
+Restore is an optional bootstrap configuration on a new `Kvrocks`:
+
+```yaml
+spec:
+  # Existing image, storage, and auth fields still apply.
+  bootstrap:
+    restore:
+      s3:
+        bucket: example-kvrocks-backups
+        region: eu-west-1
+        manifestKey: example/<source-uid>/<backup-uid>/manifest.json
+        credentialsSecretRef:
+          name: backup-reader
+      manifestSHA256: "<64 lowercase hexadecimal characters>"
+```
+
+The entire bootstrap configuration is immutable, including its presence: it cannot be added, removed, or changed after creation. Restore addresses a manifest directly so it can eventually work without the original source cluster or backup resource. The checksum must come from an independently preserved backup result.
+
+Source and Secret references are local to the requesting resource's namespace. Admission validates required fields, names, lengths, checksums, and immutability. Resource existence, credentials, object-store access, and database/artifact compatibility require reconciliation and worker checks. Custom endpoints and credential Secret keys will be defined with the transfer implementation; this slice does not claim support for arbitrary S3-compatible providers.
+
+Backup status has source/PVC identities, start and completion times, an artifact key/checksum/byte count, and standard conditions. Status uses a separate API subresource; ordinary create/update requests cannot set it. No controller populates backup status yet. The generated schema and admission rules are tested against a real isolated API server with `make test`.
 
 ## Checkpoint protocol and local artifact format
 
-`internal/backup` implements the first part of backup/restore: capture a physical checkpoint from Kvrocks 2.17.0, publish a verifiable local artifact, and materialize its files into a fresh offline directory. It is an internal library, not yet a Kubernetes backup API or an object-store backup service.
+`internal/backup` implements the first part of backup/restore: capture a physical checkpoint from Kvrocks 2.17.0, publish a verifiable local artifact, and materialize its files into a fresh offline directory. It is an internal library; the backup API is not yet connected to it or to object storage.
 
 Read `checkpoint.go` first. `Capturer.Capture` validates the request, obtains a filesystem lock, observes an existing operation, and either returns its verified artifact or starts one save. The `Database` interface describes the three operations the caller needs: inspect, set the backup directory, and request `BGSAVE`. `redis.go` implements them on a dedicated connection with automatic command retries disabled. After a connection failure, create a new adapter to resume observation; never reset and reuse a broken session to send another save.
 
