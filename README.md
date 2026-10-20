@@ -2,7 +2,7 @@
 
 A Go operator for durable [Apache Kvrocks](https://github.com/apache/kvrocks) databases, licensed under Apache-2.0.
 
-The first milestone manages one persistent standalone instance. Backup/restore, replication, and sharding are planned milestones. This is an initial implementation for development and learning; it has no high availability or automated recovery from volume loss.
+The first milestone manages one persistent standalone instance. Backup/restore, replication, and sharding are planned milestones. This is an initial implementation; it has no high availability or automated recovery from volume loss.
 
 ## API
 
