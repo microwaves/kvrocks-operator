@@ -24,6 +24,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
+// KvrocksSpec describes the standalone database and its initialization source.
+// +kubebuilder:validation:XValidation:rule="has(self.bootstrap) == has(oldSelf.bootstrap)",message="bootstrap cannot be added or removed after creation"
 type KvrocksSpec struct {
 	// Image is immutable until database upgrade workflows are implemented.
 	// +kubebuilder:default="apache/kvrocks:2.17.0"
@@ -37,12 +39,37 @@ type KvrocksSpec struct {
 	Storage StorageSpec `json:"storage"`
 	Auth    AuthSpec    `json:"auth"`
 
+	// Bootstrap initializes a new volume from a backup. Omit it for an empty database.
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="bootstrap is immutable; create a new Kvrocks resource to restore another backup"
+	// +optional
+	Bootstrap *BootstrapSpec `json:"bootstrap,omitempty"`
+
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 	// +optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
 	// +optional
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+}
+
+type BootstrapSpec struct {
+	Restore RestoreSpec `json:"restore"`
+}
+
+type RestoreSpec struct {
+	S3 S3RestoreSource `json:"s3"`
+	// ManifestSHA256 verifies the exact manifest bytes independently of object storage.
+	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:Pattern="^[a-f0-9]{64}$"
+	ManifestSHA256 string `json:"manifestSHA256"`
+}
+
+type S3RestoreSource struct {
+	S3BucketSpec `json:",inline"`
+
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=1024
+	ManifestKey string `json:"manifestKey"`
 }
 
 type StorageSpec struct {

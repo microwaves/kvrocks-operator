@@ -48,6 +48,8 @@ spec:
           metadata:
             type: object
           spec:
+            description: KvrocksSpec describes the standalone database and its initialization
+              source.
             properties:
               auth:
                 properties:
@@ -69,6 +71,63 @@ spec:
                 required:
                 - passwordSecretRef
                 type: object
+              bootstrap:
+                description: Bootstrap initializes a new volume from a backup. Omit
+                  it for an empty database.
+                properties:
+                  restore:
+                    properties:
+                      manifestSHA256:
+                        description: ManifestSHA256 verifies the exact manifest bytes
+                          independently of object storage.
+                        maxLength: 64
+                        pattern: ^[a-f0-9]{64}$
+                        type: string
+                      s3:
+                        properties:
+                          bucket:
+                            maxLength: 63
+                            minLength: 3
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            type: string
+                          credentialsSecretRef:
+                            properties:
+                              name:
+                                description: Name identifies a Secret in the requesting
+                                  resource's namespace.
+                                maxLength: 253
+                                minLength: 1
+                                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                type: string
+                            required:
+                            - name
+                            type: object
+                          manifestKey:
+                            maxLength: 1024
+                            minLength: 1
+                            type: string
+                          region:
+                            maxLength: 63
+                            minLength: 1
+                            pattern: ^[a-z0-9]+(-[a-z0-9]+)*$
+                            type: string
+                        required:
+                        - bucket
+                        - credentialsSecretRef
+                        - manifestKey
+                        - region
+                        type: object
+                    required:
+                    - manifestSHA256
+                    - s3
+                    type: object
+                required:
+                - restore
+                type: object
+                x-kubernetes-validations:
+                - message: bootstrap is immutable; create a new Kvrocks resource to
+                    restore another backup
+                  rule: self == oldSelf
               image:
                 default: apache/kvrocks:2.17.0
                 description: Image is immutable until database upgrade workflows are
@@ -208,6 +267,9 @@ spec:
             - auth
             - storage
             type: object
+            x-kubernetes-validations:
+            - message: bootstrap cannot be added or removed after creation
+              rule: has(self.bootstrap) == has(oldSelf.bootstrap)
           status:
             properties:
               conditions:

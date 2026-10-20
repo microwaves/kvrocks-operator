@@ -88,6 +88,16 @@ func (r *KvrocksReconciler) Reconcile(ctx context.Context, request ctrl.Request)
 }
 
 func (r *KvrocksReconciler) reconcileDatabase(ctx context.Context, db *kvrocksv1alpha1.Kvrocks) error {
+	if db.Spec.Bootstrap != nil {
+		// Accepting the API must never silently initialize an empty database.
+		meta.SetStatusCondition(&db.Status.Conditions, metav1.Condition{
+			Type: "Restored", Status: metav1.ConditionFalse, Reason: "RestoreNotImplemented",
+			Message:            "Restore execution is not implemented; the database has not been started",
+			ObservedGeneration: db.Generation,
+		})
+		return blocked("RestoreNotImplemented", "restore execution is not implemented; refusing to initialize an empty database")
+	}
+
 	secret := &corev1.Secret{}
 	reference := db.Spec.Auth.PasswordSecretRef
 	if err := r.Get(ctx, client.ObjectKey{Namespace: db.Namespace, Name: reference.Name}, secret); err != nil {

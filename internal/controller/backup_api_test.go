@@ -6,11 +6,14 @@ import (
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kvrocksv1alpha1 "github.com/microwaves/kvrocks-operator/api/v1alpha1"
@@ -25,6 +28,9 @@ func TestBackupAPIIntegration(t *testing.T) {
 		{"backup admission", testBackupAdmission},
 		{"backup spec is immutable", testBackupImmutability},
 		{"backup status subresource", testBackupStatus},
+		{"restore admission", testRestoreAdmission},
+		{"bootstrap is immutable", testBootstrapImmutability},
+		{"restore cannot start an empty database", testRestoreCannotStartEmptyDatabase},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) { test.run(t, api) })
@@ -55,6 +61,18 @@ func testBackupBucket() kvrocksv1alpha1.S3BucketSpec {
 		Bucket:               "test-backups",
 		Region:               "eu-west-1",
 		CredentialsSecretRef: kvrocksv1alpha1.BackupCredentialsSecretReference{Name: "backup-credentials"},
+	}
+}
+
+func testRestoreBootstrap() *kvrocksv1alpha1.BootstrapSpec {
+	return &kvrocksv1alpha1.BootstrapSpec{
+		Restore: kvrocksv1alpha1.RestoreSpec{
+			S3: kvrocksv1alpha1.S3RestoreSource{
+				S3BucketSpec: testBackupBucket(),
+				ManifestKey:  "orders/source-uid/backup-uid/manifest.json",
+			},
+			ManifestSHA256: strings.Repeat("a", 64),
+		},
 	}
 }
 
@@ -249,6 +267,120 @@ func assertBackupStatusValidation(t *testing.T, api client.Client, backup *kvroc
 			test.change(&changed.Status)
 			expectInvalidField(t, api.Status().Update(t.Context(), changed), test.field)
 		})
+	}
+}
+
+func testRestoreAdmission(t *testing.T, api client.Client) {
+	invalid := []struct {
+		name  string
+		field string
+		value any
+	}{
+		{"missing-restore", "spec.bootstrap.restore", nil},
+		{"missing-s3", "spec.bootstrap.restore.s3", nil},
+		{"missing-bucket", "spec.bootstrap.restore.s3.bucket", nil},
+		{"invalid-bucket", "spec.bootstrap.restore.s3.bucket", "INVALID_BUCKET"},
+		{"missing-region", "spec.bootstrap.restore.s3.region", nil},
+		{"missing-secret", "spec.bootstrap.restore.s3.credentialsSecretRef", nil},
+		{"invalid-secret", "spec.bootstrap.restore.s3.credentialsSecretRef.name", "another/secret"},
+		{"missing-key", "spec.bootstrap.restore.s3.manifestKey", nil},
+		{"empty-key", "spec.bootstrap.restore.s3.manifestKey", ""},
+		{"long-key", "spec.bootstrap.restore.s3.manifestKey", strings.Repeat("a", 1025)},
+		{"missing-digest", "spec.bootstrap.restore.manifestSHA256", nil},
+		{"short-digest", "spec.bootstrap.restore.manifestSHA256", strings.Repeat("a", 63)},
+		{"long-digest", "spec.bootstrap.restore.manifestSHA256", strings.Repeat("a", 65)},
+		{"uppercase-digest", "spec.bootstrap.restore.manifestSHA256", strings.Repeat("A", 64)},
+		{"non-hex-digest", "spec.bootstrap.restore.manifestSHA256", strings.Repeat("g", 64)},
+	}
+	for _, test := range invalid {
+		t.Run(test.name, func(t *testing.T) {
+			db := testDatabase("restore-" + test.name)
+			db.UID = ""
+			db.Spec.Bootstrap = testRestoreBootstrap()
+			object := admissionObject(t, db, "Kvrocks")
+			setAdmissionField(t, object, test.field, test.value)
+			expectInvalidField(t, api.Create(t.Context(), object), test.field)
+		})
+	}
+}
+
+func testBootstrapImmutability(t *testing.T, api client.Client) {
+	ctx := t.Context()
+	empty := createTestDatabase(t, api, "empty-bootstrap")
+	changed := empty.DeepCopy()
+	changed.Spec.Bootstrap = testRestoreBootstrap()
+	expectInvalidField(t, api.Update(ctx, changed), "spec")
+
+	db := testDatabase("immutable-bootstrap")
+	db.UID = ""
+	db.Spec.Image = ""
+	db.Spec.Bootstrap = testRestoreBootstrap()
+	if err := api.Create(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if db.Spec.Image != "apache/kvrocks:2.17.0" {
+		t.Fatalf("restore changed the image default: %q", db.Spec.Image)
+	}
+	changes := []struct {
+		name   string
+		change func(*kvrocksv1alpha1.Kvrocks)
+	}{
+		{"remove", func(db *kvrocksv1alpha1.Kvrocks) { db.Spec.Bootstrap = nil }},
+		{"bucket", func(db *kvrocksv1alpha1.Kvrocks) { db.Spec.Bootstrap.Restore.S3.Bucket = "another-bucket" }},
+		{"region", func(db *kvrocksv1alpha1.Kvrocks) { db.Spec.Bootstrap.Restore.S3.Region = "us-east-1" }},
+		{"key", func(db *kvrocksv1alpha1.Kvrocks) { db.Spec.Bootstrap.Restore.S3.ManifestKey = "another/manifest.json" }},
+		{"digest", func(db *kvrocksv1alpha1.Kvrocks) { db.Spec.Bootstrap.Restore.ManifestSHA256 = strings.Repeat("b", 64) }},
+		{"secret", func(db *kvrocksv1alpha1.Kvrocks) {
+			db.Spec.Bootstrap.Restore.S3.CredentialsSecretRef.Name = "another-secret"
+		}},
+	}
+	for _, test := range changes {
+		t.Run(test.name, func(t *testing.T) {
+			changed := db.DeepCopy()
+			test.change(changed)
+			expectInvalidField(t, api.Update(t.Context(), changed), "spec")
+		})
+	}
+	changed = db.DeepCopy()
+	expectInvalidField(t, api.Patch(ctx, changed, client.RawPatch(types.MergePatchType, []byte(`{"spec":{"bootstrap":null}}`))), "spec")
+	missingRestore := admissionObject(t, db, "Kvrocks")
+	setAdmissionField(t, missingRestore, "spec.bootstrap", map[string]any{})
+	expectInvalidField(t, api.Update(ctx, missingRestore), "spec.bootstrap")
+
+	// Unrelated database settings remain editable with bootstrap present or absent.
+	for _, current := range []*kvrocksv1alpha1.Kvrocks{empty, db} {
+		current.Labels = map[string]string{"purpose": "recovery-drill"}
+		current.Spec.Auth.PasswordSecretRef.Name = "rotated-auth"
+		if err := api.Update(ctx, current); err != nil {
+			t.Fatal("bootstrap validation rejected an unrelated update:", err)
+		}
+	}
+}
+
+func testRestoreCannotStartEmptyDatabase(t *testing.T, api client.Client) {
+	db := testDatabase("blocked-restore")
+	db.UID = ""
+	db.Spec.Bootstrap = testRestoreBootstrap()
+	if err := api.Create(t.Context(), db); err != nil {
+		t.Fatal(err)
+	}
+	createTestSecret(t, api, db)
+
+	for range 2 {
+		reconcileAndExpect(t, api, db, "RestoreNotImplemented")
+		restored := meta.FindStatusCondition(db.Status.Conditions, "Restored")
+		if !meta.IsStatusConditionFalse(db.Status.Conditions, "Ready") ||
+			restored == nil || restored.Status != metav1.ConditionFalse || restored.ObservedGeneration != db.Generation {
+			t.Fatalf("restore must remain visibly blocked: %+v", db.Status.Conditions)
+		}
+	}
+	for _, object := range []client.Object{
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: db.Name + "-data", Namespace: db.Namespace}},
+		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: db.Name, Namespace: db.Namespace}},
+	} {
+		if err := api.Get(t.Context(), client.ObjectKeyFromObject(object), object); !apierrors.IsNotFound(err) {
+			t.Fatalf("restore request created %T before restore execution exists: %v", object, err)
+		}
 	}
 }
 
