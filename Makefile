@@ -8,7 +8,7 @@ KUSTOMIZE := ./bin/kustomize-v5.8.1
 ENVTEST_K8S_VERSION ?= 1.37.x!
 IMG ?= kvrocks-operator:dev
 
-.PHONY: generate manifests fmt vet test test-unit test-integration test-e2e build run docker-build installer
+.PHONY: generate manifests fmt vet test test-unit test-integration test-e2e test-checkpoint build run docker-build installer
 
 generate: $(CONTROLLER_GEN)
 	"$(CONTROLLER_GEN)" object:headerFile=hack/boilerplate.go.txt,year=2026 paths="./..."
@@ -32,6 +32,9 @@ test-integration: generate manifests $(ENVTEST)
 
 test-e2e: generate manifests
 	go test -tags=e2e ./test/e2e/... -v -count=1 -timeout=15m
+
+test-checkpoint:
+	bash hack/test-checkpoint.sh
 
 build: generate manifests
 	go build -o bin/manager ./cmd

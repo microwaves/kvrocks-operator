@@ -91,6 +91,14 @@ make test-integration
 
 Unit tests cover credential validation and resource safety. Integration tests start a real API server and etcd with `envtest`; they cover validation/defaults, reconciliation, readiness, no-op convergence, repair, rotation, and storage ownership. `envtest` does not run built-in controllers or actual database processes.
 
+The checkpoint protocol has its own real-engine test:
+
+```bash
+make test-checkpoint
+```
+
+This command creates a temporary kind 1.37.0 cluster and a dedicated kubeconfig, runs the Go tests with Kvrocks 2.17.0 on a PVC as user 999, and removes the cluster on exit. It requires Docker, kind, and kubectl on `PATH`. It does not use the current Kubernetes context. Unit tests for the protocol also run in `make test-unit` with the race detector.
+
 For the complete lifecycle test, build and load the image into the dedicated cluster above, then run:
 
 ```bash
@@ -116,4 +124,55 @@ Before starting the first database Pod, the operator persists the volume name an
 
 Standalone and cluster modes use different Kvrocks key encodings. Transitioning an existing standalone dataset to sharding will require a migration; the operator will not toggle cluster mode on an existing volume.
 
-Backups, replication, failover, sharding, volume expansion, image upgrades, external exposure, and cache-specific durability settings are not yet implemented. A single local kind node does not validate storage-provider durability or multi-zone behavior.
+Managed backup/restore resources, object-store transfer, replication, failover, sharding, volume expansion, image upgrades, external exposure, and cache-specific durability settings are not yet implemented. A single local kind node does not validate storage-provider durability or multi-zone behavior.
+
+## Checkpoint protocol and local artifact format
+
+`internal/backup` implements the first part of backup/restore: capture a physical checkpoint from Kvrocks 2.17.0, publish a verifiable local artifact, and materialize its files into a fresh offline directory. It is an internal library, not yet a Kubernetes backup API or an object-store backup service.
+
+Read `checkpoint.go` first. `Capturer.Capture` validates the request, obtains a filesystem lock, observes an existing operation, and either returns its verified artifact or starts one save. The `Database` interface describes the three operations the caller needs: inspect, set the backup directory, and request `BGSAVE`. `redis.go` implements them on a dedicated connection with automatic command retries disabled. After a connection failure, create a new adapter to resume observation; never reset and reuse a broken session to send another save.
+
+The Kvrocks version is an explicit compatibility constraint, named `supportedKvrocksVersion` in the checkpoint implementation. Only 2.17.0 has passed the real-engine capture and restore checks. Supporting another release requires checking its checkpoint behavior and passing those tests before changing this constraint. The artifact format identifier is separately versioned; it identifies the manifest schema and does not follow the Kvrocks release number.
+
+The database must run in standalone mode with synchronous writes, WAL and namespace replication enabled. The worker requires `max-backup-to-keep 1`, `max-backup-keep-hours 0`, `purge-backup-on-fullsync no`, and an empty native backup schedule. It validates these settings rather than silently changing them. `db-name` must match the request's namespace/name. These settings are supplied by the isolated test fixture; integrating them with managed backup Jobs is subsequent work.
+
+The shared database volume contains:
+
+```text
+operator-backup/
+  .lock
+  active.json                 # present while an operation is unresolved
+  <request-id>/
+    intent.json               # source IDs, server PID, destination, start time
+    incoming.tmp/             # Kvrocks's incomplete checkpoint, when present
+    incoming/                 # published by Kvrocks after checkpoint creation
+    checkpoint/               # incoming is renamed here before hashing
+    captured.json             # stable upper bound on capture time
+    manifest.json             # published last; marks a completed local artifact
+```
+
+`incoming` and `checkpoint` are successive names for the same directory. The worker never opens the live RocksDB directory. The same-filesystem rename protects a completed checkpoint from later saves and purges of Kvrocks's configured backup path. The transfer unit is `manifest.json` plus `checkpoint/`; journals are local coordination records. Local artifacts remain on the volume until explicitly removed. Retention and orphan cleanup are not implemented in this slice.
+
+The filesystem lock serializes live workers. The durable active record prevents another request from changing the backup directory after the lock holder dies. The worker records intent before sending `BGSAVE` and sends it at most once for that request. A replacement worker observes the original destination and process information. It never treats `BGSAVE` acceptance or a changed `LASTSAVE` timestamp as proof of completion.
+
+| Interruption | Behavior |
+| --- | --- |
+| Worker dies after save acceptance | Resume observation of the same checkpoint; do not send another save. |
+| Worker dies after checkpoint rename | Hash and publish the protected files without contacting Kvrocks. |
+| Save response is lost and no completed checkpoint exists | Return `ErrIndeterminate`; preserve the active record and block later requests. |
+| Kvrocks restarts before protection | Preserve the unresolved operation and block later requests. PID changes can reject a result but cannot authorize releasing the fence. |
+| Manifest already exists | Verify and return the same artifact; missing or modified files are errors. |
+
+The ambiguous pre-send case is deliberately conservative. The journal cannot distinguish a crash immediately before sending the command from a lost response. Retry observation with the same request. Kvrocks 2.17.0 does not expose Redis's unique `run_id`; PID and uptime cannot prove a unique process incarnation. Therefore this slice provides no automatic abandonment of an unresolved operation, even following a restart. A future lifecycle-aware recovery mechanism must prove that the old server cannot execute the pending command before releasing the fence. Do not clear journals or issue competing administrative backup/configuration commands while a managed operation is active.
+
+`artifact.go` defines the format `kvrocks-operator.org/checkpoint/v1alpha1`. Its JSON manifest contains the request and source resource/PVC UIDs, Kvrocks version, encoding, diagnostic server PID, capture time bounds, and a sorted list of file names, byte lengths, and SHA-256 checksums. The PID is not a unique identity or a fencing token. The manifest checksum is computed over its exact bytes and returned separately. It must be preserved by the eventual caller outside the source volume for disaster recovery.
+
+All checkpoint files are included, including WAL; copying only SST files can lose unflushed data. Files are flat, regular files. Verification rejects unsafe paths, symlinks, duplicates, unknown formats/versions/fields, extra or missing files, and mismatched sizes or hashes. `CURRENT` must reference a MANIFEST in that checkpoint. JSON metadata is limited to 16 MiB. Administrator runtime configuration is excluded; database-persisted namespace tokens are included in the checkpoint and should be protected as sensitive data.
+
+Files and directories are synchronized before the manifest is published through an atomic, non-replacing hard link. The implementation requires a POSIX filesystem with working `flock`, hard links, same-filesystem rename, and synchronization semantics. This is local worker coordination, not fencing against a storage split-brain or an administrator changing the files.
+
+`Verify` checks integrity against an independently supplied manifest checksum. It does not prove that RocksDB can open the database. `Materialize` verifies and copies the checkpoint into an exclusively created offline directory, checking file hashes during copying as well. It never overwrites an existing directory; an interrupted copy remains for diagnosis. Kubernetes bootstrap, durable restore-completion markers, and retrying interrupted restores belong to the next slice.
+
+The real-engine test opens the materialized checkpoint with another Kvrocks 2.17.0 process. It checks strings, hashes, lists, sets, sorted sets, streams, namespace data and tokens, unchanged expiration deadlines, writes before/after capture, and atomic paired writes during capture. It also races two worker processes, crashes workers, restarts Kvrocks, and verifies that later backups and native purge operations cannot change the protected artifact. Object-store publication, other versions/storage drivers, and power-loss durability remain separate acceptance work.
+
+The protocol follows the pinned [checkpoint implementation](https://github.com/apache/kvrocks/blob/v2.17.0/src/storage/storage.cc) and [asynchronous save implementation](https://github.com/apache/kvrocks/blob/v2.17.0/src/server/server.cc). Capture timestamps bound the operation; they are not exact sequence timestamps or a point-in-time recovery capability.

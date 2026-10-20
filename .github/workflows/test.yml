@@ -19,7 +19,7 @@ jobs:
           go-version-file: go.mod
       - run: make test
       - run: go vet ./...
-      - run: shellcheck internal/controller/startup.sh
+      - run: shellcheck internal/controller/startup.sh hack/test-checkpoint.sh
       - run: git diff --exit-code -- api config go.mod go.sum
 
   lifecycle:
@@ -53,3 +53,22 @@ jobs:
       - name: Remove test cluster
         if: always()
         run: kind delete cluster --name "${KIND_CLUSTER}"
+
+  checkpoint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Install isolated-cluster tools
+        run: |
+          set -euo pipefail
+          go install sigs.k8s.io/kind@v0.33.0
+          mkdir -p bin
+          curl -fsSL https://dl.k8s.io/release/v1.37.1/bin/linux/amd64/kubectl -o bin/kubectl
+          chmod +x bin/kubectl
+      - name: Test Kvrocks checkpoint and artifact protocol
+        run: PATH="${PWD}/bin:${PATH}" make test-checkpoint

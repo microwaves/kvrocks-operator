@@ -25,6 +25,21 @@ import (
 const namespace = "kvrocks-operator-system"
 
 func TestStandaloneLifecycle(t *testing.T) {
+	prepareLifecycleCluster(t)
+	db, secret := createAuthenticatedDatabase(t)
+	pod := db.Name + "-0"
+	volumeUID := field(t, "pvc", db.Name+"-data", ".metadata.uid")
+
+	assertAuthenticationAndDurability(t, pod)
+	assertPodReplacementPreservesData(t, db, volumeUID)
+	assertDeletedChildrenAreRepaired(t, db)
+	assertOperatorRestartPreservesData(t, pod)
+	assertPasswordRotationPreservesData(t, db, secret)
+	assertRetainedStorageCannotBeAdopted(t, db, volumeUID)
+}
+
+func prepareLifecycleCluster(t *testing.T) {
+	t.Helper()
 	if os.Getenv("KUBECONFIG") == "" || os.Getenv("KIND_CLUSTER") == "" {
 		t.Fatal("set KUBECONFIG and KIND_CLUSTER to an isolated kind cluster")
 	}
@@ -37,13 +52,20 @@ func TestStandaloneLifecycle(t *testing.T) {
 
 	// Reset only this test's fixtures; retained volumes make this explicit.
 	for _, fixture := range []struct{ kind, name string }{
-		{"kvrocks", "e2e-database"}, {"statefulset", "e2e-database"},
-		{"pvc", "e2e-database-data"}, {"configmap", "e2e-database-config"},
-		{"service", "e2e-database"}, {"service", "e2e-database-headless"}, {"secret", "e2e-auth"},
+		{"kvrocks", "e2e-database"},
+		{"statefulset", "e2e-database"},
+		{"pvc", "e2e-database-data"},
+		{"configmap", "e2e-database-config"},
+		{"service", "e2e-database"},
+		{"service", "e2e-database-headless"},
+		{"secret", "e2e-auth"},
 	} {
 		kubectl(t, nil, "-n", namespace, "delete", fixture.kind, fixture.name, "--ignore-not-found", "--timeout=90s")
 	}
+}
 
+func createAuthenticatedDatabase(t *testing.T) (*kvrocksv1alpha1.Kvrocks, *corev1.Secret) {
+	t.Helper()
 	db := &kvrocksv1alpha1.Kvrocks{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "kvrocks-operator.org/v1alpha1", Kind: "Kvrocks"},
 		ObjectMeta: metav1.ObjectMeta{Name: "e2e-database", Namespace: namespace},
@@ -71,7 +93,11 @@ func TestStandaloneLifecycle(t *testing.T) {
 	}
 	apply(t, secret)
 	kubectl(t, nil, "-n", namespace, "wait", "--for=condition=Ready", "kvrocks/"+db.Name, "--timeout=180s")
-	pod := db.Name + "-0"
+	return db, secret
+}
+
+func assertAuthenticationAndDurability(t *testing.T, pod string) {
+	t.Helper()
 	if got := databaseCommand(t, pod, "SET", "learning", "persisted"); got != "OK" {
 		t.Fatalf("SET failed: %s", got)
 	}
@@ -82,7 +108,11 @@ func TestStandaloneLifecycle(t *testing.T) {
 	if !strings.Contains(unauthenticated, "NOAUTH") {
 		t.Fatalf("unauthenticated connection was not rejected: %s", unauthenticated)
 	}
-	volumeUID := field(t, "pvc", db.Name+"-data", ".metadata.uid")
+}
+
+func assertPodReplacementPreservesData(t *testing.T, db *kvrocksv1alpha1.Kvrocks, volumeUID string) {
+	t.Helper()
+	pod := db.Name + "-0"
 	podUID := field(t, "pod", pod, ".metadata.uid")
 
 	t.Log("Replacing the Pod and verifying data on the original volume")
@@ -96,7 +126,10 @@ func TestStandaloneLifecycle(t *testing.T) {
 	if got := field(t, "pvc", db.Name+"-data", ".metadata.uid"); got != volumeUID {
 		t.Fatalf("Pod replacement changed the data volume: %s -> %s", volumeUID, got)
 	}
+}
 
+func assertDeletedChildrenAreRepaired(t *testing.T, db *kvrocksv1alpha1.Kvrocks) {
+	t.Helper()
 	t.Log("Repairing deleted Service and ConfigMap resources")
 	for _, child := range []struct{ kind, name string }{{"service", db.Name}, {"configmap", db.Name + "-config"}} {
 		oldUID := field(t, child.kind, child.name, ".metadata.uid")
@@ -106,22 +139,32 @@ func TestStandaloneLifecycle(t *testing.T) {
 			return uid != "" && uid != oldUID
 		})
 	}
+}
 
+func assertOperatorRestartPreservesData(t *testing.T, pod string) {
+	t.Helper()
 	t.Log("Restarting the operator and verifying convergence")
 	kubectl(t, nil, "-n", namespace, "rollout", "restart", "deployment/kvrocks-operator-controller-manager")
 	assertData(t, pod)
 	kubectl(t, nil, "-n", namespace, "rollout", "status", "deployment/kvrocks-operator-controller-manager", "--timeout=180s")
+}
 
+func assertPasswordRotationPreservesData(t *testing.T, db *kvrocksv1alpha1.Kvrocks, secret *corev1.Secret) {
+	t.Helper()
+	pod := db.Name + "-0"
 	t.Log("Rotating credentials with a controlled standalone restart")
 	oldRevision := field(t, "statefulset", db.Name, ".spec.template.metadata.annotations.kvrocks-operator\\.org/secret-revision")
-	secret.Data["password"] = []byte(hex.EncodeToString(password) + "-rotated")
+	secret.Data["password"] = append(secret.Data["password"], "-rotated"...)
 	apply(t, secret)
 	waitFor(t, "Secret revision reconciliation", func() bool {
 		return field(t, "statefulset", db.Name, ".spec.template.metadata.annotations.kvrocks-operator\\.org/secret-revision") != oldRevision
 	})
 	kubectl(t, nil, "-n", namespace, "rollout", "status", "statefulset/"+db.Name, "--timeout=180s")
 	assertData(t, pod)
+}
 
+func assertRetainedStorageCannotBeAdopted(t *testing.T, db *kvrocksv1alpha1.Kvrocks, volumeUID string) {
+	t.Helper()
 	t.Log("Retaining storage and rejecting implicit data adoption")
 	kubectl(t, nil, "-n", namespace, "delete", "kvrocks", db.Name)
 	kubectl(t, nil, "-n", namespace, "wait", "--for=delete", "statefulset/"+db.Name, "--timeout=90s")
