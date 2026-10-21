@@ -56,19 +56,23 @@ func syncDirectory(directory string) (err error) {
 	return nil
 }
 
-// A synced temporary file is linked into place without replacing an existing result.
-func publishJSON(name string, value any) (err error) {
+func publishJSON(name string, value any) error {
 	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode checkpoint metadata %s: %w", name, err)
 	}
+	return publishDocument(name, append(data, '\n'))
+}
+
+// A synced temporary file is linked into place without replacing an existing result.
+func publishDocument(name string, data []byte) (err error) {
 	directory := filepath.Dir(name)
 	file, err := os.CreateTemp(directory, ".publish-*")
 	if err != nil {
 		return fmt.Errorf("create temporary metadata file for %s: %w", name, err)
 	}
 	defer func() { err = errors.Join(err, os.Remove(file.Name())) }()
-	if _, err := file.Write(append(data, '\n')); err != nil {
+	if _, err := file.Write(data); err != nil {
 		return errors.Join(fmt.Errorf("write checkpoint metadata %s: %w", name, err), file.Close())
 	}
 	if err := file.Sync(); err != nil {
