@@ -97,7 +97,7 @@ The checkpoint protocol has its own real-engine test:
 make test-checkpoint
 ```
 
-This command creates a temporary kind 1.37.0 cluster and a dedicated kubeconfig, runs the Go tests with Kvrocks 2.17.0 on a PVC as user 999, and removes the cluster on exit. It requires Docker, kind, and kubectl on `PATH`. It does not use the current Kubernetes context. Unit tests for the protocol also run in `make test-unit` with the race detector.
+This command creates a temporary kind 1.37.0 cluster and a dedicated kubeconfig, runs the Go tests with Kvrocks 2.17.0 and SeaweedFS 4.48 on a PVC as user 999, and removes the cluster on exit. The object-storage round trip uses generated credentials and a trusted test TLS certificate, deletes the original database and checkpoint, and restores from the remote artifact into a fresh Kvrocks process. It requires Docker, kind, and kubectl on `PATH`. It does not use the current Kubernetes context. Unit and TLS transport tests also run in `make test-unit` with the race detector.
 
 For the complete lifecycle test, build and load the image into the dedicated cluster above, then run:
 
@@ -124,7 +124,7 @@ Before starting the first database Pod, the operator persists the volume name an
 
 Standalone and cluster modes use different Kvrocks key encodings. Transitioning an existing standalone dataset to sharding will require a migration; the operator will not toggle cluster mode on an existing volume.
 
-Backup/restore execution, object-store transfer, replication, failover, sharding, volume expansion, image upgrades, external exposure, and cache-specific durability settings are not yet implemented. A single local kind node does not validate storage-provider durability or multi-zone behavior.
+Managed backup/restore execution, replication, failover, sharding, volume expansion, image upgrades, external exposure, and cache-specific durability settings are not yet implemented. Checkpoint capture and object-store transfer exist as internal libraries; controllers do not execute them yet. A single local kind node does not validate storage-provider durability or multi-zone behavior.
 
 ## Backup and restore API
 
@@ -150,13 +150,13 @@ spec:
 
 The entire bootstrap configuration is immutable, including its presence: it cannot be added, removed, or changed after creation. Restore addresses a manifest directly so it can eventually work without the original source cluster or backup resource. The checksum must come from an independently preserved backup result.
 
-Source and Secret references are local to the requesting resource's namespace. Admission validates required fields, names, lengths, checksums, and immutability. Resource existence, credentials, object-store access, and database/artifact compatibility require reconciliation and worker checks. Custom endpoints and credential Secret keys will be defined with the transfer implementation; this slice does not claim support for arbitrary S3-compatible providers.
+Source and Secret references are local to the requesting resource's namespace. Admission validates required fields, names, lengths, checksums, and immutability. Resource existence, credentials, object-store access, and database/artifact compatibility require reconciliation and worker checks. The transfer library accepts a configured SDK client; custom endpoint/CA fields and credential Secret keys remain part of the worker integration. This API does not yet execute transfers or claim compatibility with arbitrary S3 providers.
 
 Backup status has source/PVC identities, start and completion times, an artifact key/checksum/byte count, and standard conditions. Status uses a separate API subresource; ordinary create/update requests cannot set it. No controller populates backup status yet. The generated schema and admission rules are tested against a real isolated API server with `make test`.
 
 ## Checkpoint protocol and local artifact format
 
-`internal/backup` implements the first part of backup/restore: capture a physical checkpoint from Kvrocks 2.17.0, publish a verifiable local artifact, and materialize its files into a fresh offline directory. It is an internal library; the backup API is not yet connected to it or to object storage.
+`internal/backup` captures a physical checkpoint from Kvrocks 2.17.0, publishes a verifiable local artifact, transfers it through object storage, and materializes its files into a fresh offline directory. It is an internal library; the backup API is not yet connected to it.
 
 Read `checkpoint.go` first. `Capturer.Capture` validates the request, obtains a filesystem lock, observes an existing operation, and either returns its verified artifact or starts one save. The `Database` interface describes the three operations the caller needs: inspect, set the backup directory, and request `BGSAVE`. `redis.go` implements them on a dedicated connection with automatic command retries disabled. After a connection failure, create a new adapter to resume observation; never reset and reuse a broken session to send another save.
 
@@ -201,6 +201,33 @@ Files and directories are synchronized before the manifest is published through 
 
 `Verify` checks integrity against an independently supplied manifest checksum. It does not prove that RocksDB can open the database. `Materialize` verifies and copies the checkpoint into an exclusively created offline directory, checking file hashes during copying as well. It never overwrites an existing directory; an interrupted copy remains for diagnosis. Kubernetes bootstrap, durable restore-completion markers, and retrying interrupted restores belong to the next slice.
 
-The real-engine test opens the materialized checkpoint with another Kvrocks 2.17.0 process. It checks strings, hashes, lists, sets, sorted sets, streams, namespace data and tokens, unchanged expiration deadlines, writes before/after capture, and atomic paired writes during capture. It also races two worker processes, crashes workers, restarts Kvrocks, and verifies that later backups and native purge operations cannot change the protected artifact. Object-store publication, other versions/storage drivers, and power-loss durability remain separate acceptance work.
+The real-engine test opens the materialized checkpoint with another Kvrocks 2.17.0 process. It checks strings, hashes, lists, sets, sorted sets, streams, namespace data and tokens, unchanged expiration deadlines, writes before/after capture, and atomic paired writes during capture. It also races two worker processes, crashes workers, restarts Kvrocks, and verifies that later backups and native purge operations cannot change the protected artifact. Other versions/storage drivers and power-loss durability remain separate acceptance work.
 
 The protocol follows the pinned [checkpoint implementation](https://github.com/apache/kvrocks/blob/v2.17.0/src/storage/storage.cc) and [asynchronous save implementation](https://github.com/apache/kvrocks/blob/v2.17.0/src/server/server.cc). Capture timestamps bound the operation; they are not exact sequence timestamps or a point-in-time recovery capability.
+
+## Object-storage transfer
+
+`Transfer` accepts an `ObjectStore` with just `Get` and `PutIfAbsent`. `S3` implements these operations using the official AWS Go SDK. The caller supplies a client configured with credentials, region, HTTPS endpoint and trusted CAs, plus an existing bucket. The library does not load Kubernetes Secrets, create buckets, delete objects or trigger another checkpoint.
+
+The caller supplies a stable manifest key and its independently preserved SHA-256. Checkpoint objects live beside that key:
+
+```text
+<prefix>/<source-uid>/<backup-uid>/
+  checkpoint/<file-name>
+  manifest.json
+```
+
+Read `transfer.go` for upload, `download.go` for download, and `s3.go` for the transport boundary:
+
+1. `Upload` first checks for a committed remote manifest. If present, it verifies the manifest and every referenced object, so a retry can finish even after the local artifact disappears.
+2. Otherwise, it validates the local artifact and uploads each missing checkpoint file. Every write uses `If-None-Match: *`; existing objects are never overwritten. Each uploaded or reused object is read back and checked against its size and SHA-256. An ETag is not used as an integrity checksum.
+3. Only after every file passes does it conditionally publish the exact manifest bytes. A lost PUT response is resolved by reading the object. Conflicting or corrupted content returns an error instead of replacing a backup.
+4. `Download` locks a dedicated local directory and persists `download.json`, binding it to one manifest key and checksum. It reuses verified completed files and copies missing files through `download.tmp`. Each file is checked, synchronized, and linked into place without replacement. The exact manifest is published last, after the complete local artifact passes verification.
+
+The SDK makes at most three attempts per request, with its retry backoff and the caller's context governing cancellation. A failed response-body read returns an error; the caller can retry the whole transfer with the same key, digest and directory. Completed files are reused. Downloads require the same POSIX filesystem semantics as capture; use an empty directory or the directory reserved by an earlier attempt. A completed download can be verified offline. This journal tracks artifact transfer, not the later database bootstrap: `Materialize` still requires a fresh offline target.
+
+Transfers are sequential and stream checkpoint files with bounded memory. The first implementation limits each checkpoint file to 5 GiB and the manifest to 16 MiB; it has no multipart upload, range resume, retention or orphan cleanup. Read-back verification adds network traffic. The bucket/prefix must be protected from external mutation and deletion while transfers run; conditional creation is not a substitute for a retention or access policy. Upload needs read and write object permissions, and restore needs read permission; neither path lists the bucket. On AWS, upload also requires `s3:ListBucket` permission on the bucket so missing keys return 404 instead of AccessDenied; denied reads remain errors. See the [GetObject permission rules](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html).
+
+Compatibility was exercised with SeaweedFS 4.48 over TLS and Kvrocks 2.17.0 in the isolated cluster test. Tests cover partial transfers, lost publication responses, duplicate workers, request retry limits, rewound upload bodies, corrupt/missing objects, cancellation, and unsafe local directory reuse. AWS S3 itself, other providers, large-file boundary behavior and power-loss recovery remain unverified. SeaweedFS is only part of the test image, not the deployed operator.
+
+The publication protocol follows [S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html); transport retries follow the [AWS SDK retry configuration](https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/configure-retries-timeouts.html). Backup Jobs, reconciliation, Secret/endpoint configuration and durable database bootstrap are the next integration work. Milestone two remains incomplete.
