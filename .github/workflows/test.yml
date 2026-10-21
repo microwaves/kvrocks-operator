@@ -70,5 +70,5 @@ jobs:
           mkdir -p bin
           curl -fsSL https://dl.k8s.io/release/v1.37.1/bin/linux/amd64/kubectl -o bin/kubectl
           chmod +x bin/kubectl
-      - name: Test Kvrocks checkpoint and artifact protocol
+      - name: Test Kvrocks checkpoint, object transfer and restore
         run: PATH="${PWD}/bin:${PATH}" make test-checkpoint
